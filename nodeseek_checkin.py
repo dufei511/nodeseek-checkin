@@ -12,8 +12,8 @@ from scrapling.fetchers import StealthyFetcher
 from playwright.sync_api import Page
 
 # Config from environment or defaults
-USERNAME = os.environ.get("NODESEEK_USERNAME", "yubinbin")
-PASSWORD = os.environ.get("NODESEEK_PASSWORD", "bbY211080")
+USERNAME = os.environ.get("NODESEEK_USERNAME")
+PASSWORD = os.environ.get("NODESEEK_PASSWORD")
 COOKIE_FILE = os.environ.get("NODESEEK_COOKIE_FILE", "/tmp/nodeseek_cookies.json")
 
 HOME_URL = "https://www.nodeseek.com/"
