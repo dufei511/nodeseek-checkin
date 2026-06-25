@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 23:00 = CST 07:00 每天
     - cron: '0 23 * * *'
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   checkin:
@@ -20,11 +20,21 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 2>/dev/null || true
+
+      - name: Install Python deps
         run: |
           pip install -r requirements.txt
-          python -m playwright install chromium
-          sudo apt-get update && sudo apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 2>/dev/null || true
+          python -m playwright install chromium 2>&1 | tail -3
+
+      - name: Restore cookies cache
+        id: cookie-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/nodeseek_cookies.json
+          key: nodeseek-cookies-${{ runner.os }}
 
       - name: Run check-in
         env:
@@ -32,7 +42,3 @@ jobs:
           NODESEEK_PASSWORD: ${{ secrets.NODESEEK_PASSWORD }}
           NODESEEK_COOKIE_FILE: /tmp/nodeseek_cookies.json
         run: python nodeseek_checkin.py
-
-      - name: Check result
-        run: |
-          echo "签到结果见上一步输出"

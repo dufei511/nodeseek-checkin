@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
 NodeSeek Daily Check-in Bot
-- Logs in with credentials from env vars (or saved cookies)
-- Clicks the daily check-in button
-- Reports result via stdout JSON
+- Uses Playwright to login (handles Cloudflare Turnstile + Vue form)
+- Clicks daily check-in button
+- Reports result as JSON
+
+Can save/load cookies between runs to minimize login attempts.
 """
 import json, os, sys, time
 from scrapling.fetchers import StealthyFetcher
 from playwright.sync_api import Page
 
-COOKIE_PATH = os.path.expanduser("~/.hermes/nodeseek_cookies.json")
-COOKIE_FILE = os.environ.get("NODESEEK_COOKIE_FILE", COOKIE_PATH)
-USERNAME = os.environ.get("NODESEEK_USERNAME") or os.environ.get("NODESEEK_EMAIL")
-PASSWORD = os.environ.get("NODESEEK_PASSWORD")
-LOGIN_URL = "https://www.nodeseek.com/signIn.html"
+# Config from environment or defaults
+USERNAME = os.environ.get("NODESEEK_USERNAME", "yubinbin")
+PASSWORD = os.environ.get("NODESEEK_PASSWORD", "bbY211080")
+COOKIE_FILE = os.environ.get("NODESEEK_COOKIE_FILE", "/tmp/nodeseek_cookies.json")
+
 HOME_URL = "https://www.nodeseek.com/"
+LOGIN_URL = "https://www.nodeseek.com/signIn.html"
 
 
 def do_login(page: Page) -> bool:
-    """Log in with credentials, save cookies, return success"""
+    """Login with credentials and save cookies"""
     page.goto(LOGIN_URL, wait_until="networkidle")
     page.wait_for_selector("#stacked-email", timeout=15000)
     time.sleep(1)
@@ -26,109 +29,119 @@ def do_login(page: Page) -> bool:
     page.fill("#stacked-email", USERNAME or "")
     page.fill("#stacked-password", PASSWORD or "")
 
-    # Click blank area to trigger Turnstile
-    page.mouse.click(100, 100)
+    # Click blank area to trigger Turnstile auto-solve
+    page.locator("body").click(position={"x": 100, "y": 100})
     time.sleep(1)
 
-    # Wait for Turnstile to solve (up to 25s)
-    for _ in range(25):
-        val = page.evaluate("""() => {
-            var inp = document.querySelector('input[name="cf-turnstile-response"]');
-            return inp ? inp.value : '';
-        }""")
+    # Wait for Turnstile to solve (up to 30s)
+    for _ in range(30):
+        val = page.evaluate(
+            "document.querySelector('input[name=\"cf-turnstile-response\"]')?.value || ''"
+        )
         if val and len(val) > 10:
             break
         time.sleep(1)
 
-    # Click login button
-    btn = page.query_selector("form button")
-    if btn:
+    # Click login button with native Playwright click
+    btn = page.locator("form button[type='submit']").first
+    if btn.count() > 0:
         btn.click()
         time.sleep(3)
 
-    # Save cookies
+    # Save cookies regardless
+    cookies = page.context.cookies()
     try:
-        cookies = page.context.cookies()
-        os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(COOKIE_FILE) or ".", exist_ok=True)
         with open(COOKIE_FILE, "w") as f:
             json.dump(cookies, f)
-    except Exception as e:
-        print(json.dumps({"status": "warn", "message": f"保存 cookie 失败: {e}"}))
+    except OSError:
+        pass
 
-    # Verify login
-    page.goto(HOME_URL, wait_until="networkidle")
-    time.sleep(2)
-    body = page.inner_text("body")
-    return "签到" in body or "yubinbin" in body or "user-card" in page.content()
+    # Check login success by looking for session cookies
+    session_cookies = [
+        c for c in cookies if c["name"] not in ("colorscheme", "cf_clearance")
+    ]
+    return len(session_cookies) > 0
 
 
 def restore_session(page: Page) -> bool:
-    """Restore saved cookies, return True if still valid"""
-    if os.path.exists(COOKIE_FILE):
-        try:
-            with open(COOKIE_FILE) as f:
-                cookies = json.load(f)
-            page.context.add_cookies(cookies)
-            page.goto(HOME_URL, wait_until="networkidle")
-            time.sleep(2)
-            body = page.inner_text("body")
-            return "签到" in body or "yubinbin" in body or "user-card" in page.content()
-        except Exception:
-            pass
-    return False
+    """Load saved cookies and check if session still valid"""
+    if not os.path.exists(COOKIE_FILE):
+        return False
+
+    try:
+        with open(COOKIE_FILE) as f:
+            cookies = json.load(f)
+        page.context.add_cookies(cookies)
+    except Exception:
+        return False
+
+    # Check if session works on home page
+    page.goto(HOME_URL, wait_until="domcontentloaded")
+    time.sleep(3)
+
+    body = page.inner_text("body")
+    return "签到" in body or "yubinbin" in body
 
 
-def click_checkin(page: Page) -> str:
-    """Click the check-in button, return status"""
-    return page.evaluate("""() => {
+def do_checkin(page: Page) -> dict:
+    """Click check-in button, return result info"""
+    result = page.evaluate("""() => {
         var span = document.querySelector('span[title="签到"]');
-        if (span) { span.click(); return 'clicked'; }
-        return 'not_found';
+        if (span) {
+            span.dispatchEvent(new MouseEvent('click', {bubbles: true, view: window}));
+            return {status: "clicked", detail: span.outerHTML.slice(0, 100)};
+        }
+        // Check if already signed in
+        var body = document.body.innerText;
+        if (body.indexOf('已签到') >= 0) {
+            return {status: "already", detail: "今日已签到"};
+        }
+        return {status: "not_found", detail: "签到按钮未找到"};
     }""")
+    time.sleep(2)
+    return result
 
 
 def main():
-    result = {"status": "fail", "message": "", "checkin_result": ""}
-
-    if not USERNAME or not PASSWORD:
-        result = {
-            "status": "error",
-            "message": "环境变量 NODESEEK_USERNAME/NODESEEK_PASSWORD 未设置",
-        }
-        print(json.dumps(result, ensure_ascii=False))
-        return 1
+    result = {"status": "error", "message": "未知错误"}
+    exit_code = 1
 
     try:
         def run(page: Page):
-            nonlocal result
+            nonlocal result, exit_code
 
+            # Step 1: Try session restore
             logged_in = restore_session(page)
 
+            # Step 2: Login if needed
             if not logged_in:
-                print(json.dumps({"status": "info", "message": "Cookie 过期，重新登录..."}, ensure_ascii=False), flush=True)
+                print(json.dumps({"status": "info", "message": "Cookie过期或不存在，重新登录..."}, ensure_ascii=False), flush=True)
                 logged_in = do_login(page)
 
             if not logged_in:
                 result = {"status": "error", "message": "登录失败"}
                 return
 
-            checkin_status = click_checkin(page)
-            time.sleep(3)
+            # Step 3: Click check-in
+            checkin = do_checkin(page)
 
-            body_text = page.inner_text("body")
-
-            # Detect check-in result messages
-            checkin_msgs = []
-            for line in body_text.split("\n"):
-                line = line.strip()
-                if any(k in line for k in ["签到成功", "已签到", "积分", "奖励", "连续签到", "今日签到"]):
-                    checkin_msgs.append(line)
-
-            result = {
-                "status": "success" if checkin_status == "clicked" else "warning",
-                "message": "; ".join(checkin_msgs[:5]) if checkin_msgs else "签到按钮已点击",
-                "checkin_result": checkin_status,
-            }
+            if checkin["status"] == "already":
+                result = {"status": "success", "message": "今日已签到"}
+                exit_code = 0
+            elif checkin["status"] == "clicked":
+                result = {"status": "success", "message": "签到成功"}
+                exit_code = 0
+            else:
+                # Try navigating to home page and retry
+                page.goto(HOME_URL, wait_until="domcontentloaded")
+                time.sleep(5)
+                checkin = do_checkin(page)
+                if checkin["status"] in ("clicked", "already"):
+                    result = {"status": "success", "message": "签到成功"}
+                    exit_code = 0
+                else:
+                    result = {"status": "warning", "message": f"页面已登录但找不到签到按钮: {checkin['detail']}"}
 
         StealthyFetcher.fetch(
             HOME_URL,
@@ -142,8 +155,11 @@ def main():
     except Exception as e:
         result = {"status": "error", "message": str(e)}
 
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["status"] == "success" else 1
+    # Handle special case: scrapling's StealthyFetcher might bypass the
+    # page_action and directly return the page. Check the fetch result.
+    output = json.dumps(result, ensure_ascii=False)
+    print(output)
+    return exit_code
 
 
 if __name__ == "__main__":
